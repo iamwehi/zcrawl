@@ -1,0 +1,31 @@
+# systemd user unit, for running zcrawl without root.
+#
+# Install:  contrib/install-user.sh systemd
+# Or by hand:
+#   install -m 0644 contrib/systemd/zcrawl-user.service ~/.config/systemd/user/zcrawl.service
+#   systemctl --user daemon-reload && systemctl --user enable --now zcrawl
+#   loginctl enable-linger "$USER"   # keep running after logout
+#
+# Expects the binary in ~/.local/bin and the config in ~/.config/zcrawl.
+# Most of the system unit's sandboxing options need privileges a user manager
+# does not have, so they are left out here.
+
+[Unit]
+Description=zcrawl Zcash network crawler
+Documentation=https://github.com/iamwehi/zcrawl
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/zcrawl --config %h/.config/zcrawl/zcrawl.toml run
+Restart=on-failure
+RestartSec=30
+# zcrawl marks the running round as interrupted on SIGTERM; give it time to
+# write that.
+TimeoutStopSec=60
+Environment=RUST_LOG=info
+NoNewPrivileges=yes
+UMask=0027
+
+[Install]
+WantedBy=default.target

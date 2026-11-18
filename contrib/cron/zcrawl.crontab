@@ -1,0 +1,10 @@
+# crontab entries for running zcrawl without root or systemd.
+#
+# Install:  contrib/install-user.sh cron
+# Or by hand:  (crontab -l 2>/dev/null; cat contrib/cron/zcrawl.crontab) | crontab -
+#
+# Starts zcrawl at boot and checks every 10 minutes that it is still running.
+# `flock -n` skips the start when zcrawl already holds the lock, so at most one
+# copy runs. cron runs these lines with /bin/sh, which expands $HOME.
+@reboot      flock -n $HOME/.local/share/zcrawl/cron.lock $HOME/.local/bin/zcrawl --config $HOME/.config/zcrawl/zcrawl.toml run >> $HOME/.local/share/zcrawl/zcrawl.log 2>&1
+*/10 * * * * flock -n $HOME/.local/share/zcrawl/cron.lock $HOME/.local/bin/zcrawl --config $HOME/.config/zcrawl/zcrawl.toml run >> $HOME/.local/share/zcrawl/zcrawl.log 2>&1

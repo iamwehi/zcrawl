@@ -24,7 +24,8 @@ Environment=RUST_LOG=info
 # 200 sockets plus SQLite; leave headroom.
 LimitNOFILE=4096
 
-# Hardening. zcrawl only needs outbound IPv4/IPv6 TCP, DNS, and its state dir.
+# Hardening. zcrawl needs outbound IPv4/IPv6 TCP, DNS, its state dir, and, with
+# listen_addr set, to accept TCP on an unprivileged port (8233).
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

@@ -1,7 +1,8 @@
 # zcrawl
 
 `zcrawl` crawls the Zcash p2p network once an hour. For every node it can reach, it records the
-software and version the node announces. From those snapshots it reports how quickly operators
+software and version the node announces. Optionally it also listens for inbound connections, to
+see nodes behind NAT or firewalls that never accept connections themselves. From those snapshots it reports how quickly operators
 adopt a release: the fraction of reachable nodes on that release or newer, plotted against hours
 since the release was published, and the time to reach 50%, 80% and 95%.
 
@@ -9,6 +10,11 @@ zcrawl collects no historical data. It records from the moment it is started.
 
 **Contact.** zcrawl announces itself as `/zcrawl:<version>/`. If it causes problems for your
 node, open an issue at **<https://github.com/iamwehi/zcrawl/issues>**.
+
+**When listening, zcrawl advertises `NODE_NETWORK` but serves no blocks.** Zebra only dials
+addresses gossiped with that service bit, so without it no node would ever connect. To limit the
+cost to your node, zcrawl answers your handshake and then hangs up straight away. It never holds
+one of your outbound slots or answers a block request.
 
 ## How a round works
 
@@ -29,10 +35,36 @@ node, open an issue at **<https://github.com/iamwehi/zcrawl/issues>**.
 On the wire, zcrawl:
 - answers `ping` with `pong` and ignores every other message;
 - never sends `getdata`, `getblocks`, `getheaders`, `inv` or `tx`;
-- advertises no services, with `relay = false` and `start_height = 0`.
+- sends `relay = false` and `start_height = 0`;
+- advertises no services, or `NODE_NETWORK` when the listener is enabled (see
+  [The listener](#the-listener)).
 
 Tor, I2P and CJDNS addresses in `addrv2` are dropped, and so are onion-cat IPv6 addresses.
 Private, loopback, documentation and other non-global addresses are skipped.
+
+## The listener
+
+Most nodes run behind NAT or a firewall. The crawler can never reach them, but they do dial out:
+Zebra keeps about 25 to 37 outbound peers, picked from addresses it has learned through gossip.
+When `listen_addr` and `external_addr` are set, `zcrawl run` also listens, so these nodes can
+reach us:
+
+1. **Announce.** In every crawl connection, our `version` advertises `NODE_NETWORK` with
+   `external_addr` as `addr_from`. After the handshake, zcrawl also sends one `addr` entry for
+   `external_addr`. Zebra caches both and passes them on when it asks that connection for peers.
+   This is how our address spreads, so it spreads slowly and without guarantees. Zebra skips
+   gossiped addresses without `NODE_NETWORK` when it picks outbound peers.
+2. **Answer.** For each inbound connection, zcrawl waits for the peer's `version`, replies with
+   `version` and `verack`, waits for the peer's `verack`, then hangs up. At most
+   `max_inbound_connections` (64) connections run at once, and further ones are dropped.
+   A connection carrying our own nonce is our crawler reaching itself, and is closed with
+   `self_connection`.
+3. **Record.** Every inbound connection is stored in `inbound`. A peer's claimed listening port,
+   combined with the connection's source IP (as Zebra does), goes into the address book. If the
+   peer really listens there, the next round reaches it.
+
+The listener runs continuously, independent of rounds. It is off by default, and with it off
+zcrawl behaves exactly as before: services 0 and nothing announced.
 
 ## Install
 
@@ -54,7 +86,10 @@ timeout 3 bash -c 'exec 3<>/dev/tcp/203.0.113.1/8233' 2>/dev/null \
   && echo "WARNING: connections are intercepted" || echo "clean"
 ```
 
-zcrawl only makes outbound connections. It needs no open inbound ports and no root.
+zcrawl needs no root. Without the listener it only makes outbound connections. With it, the
+listen port (8233 by default, which is unprivileged) must be reachable from the internet: open
+it in the host firewall and any cloud security group, and forward it if the machine is behind
+NAT. Check from another machine with `nc -vz <external ip> 8233` while zcrawl runs.
 
 ### With root: system service
 
@@ -138,6 +173,9 @@ subcommand. Every key is optional, and unknown keys are an error.
 | `extra_peers` | `[]` | Extra `host:port` peers to probe every round. |
 | `protocol_version` | 170190 | Protocol version sent in our `version` message. |
 | `allow_non_routable` | `false` | Probe private and loopback addresses (tests only). |
+| `listen_addr` | unset | Accept inbound connections here, e.g. `"[::]:8233"`. Unset: no listener. Needs `external_addr`. |
+| `external_addr` | unset | The public `ip:port` other nodes can reach the listener on. It is announced to every crawled peer and must be a global address. |
+| `max_inbound_connections` | 64 | Simultaneous inbound handshakes; further connections are dropped. |
 
 `RUST_LOG` controls logging, for example `RUST_LOG=zcrawl=debug`. Logs go to stderr.
 
@@ -168,7 +206,9 @@ handshake.
 
 ### `zcrawl run [--once]`
 
-Runs rounds until SIGINT or SIGTERM. `--once` runs a single round and exits.
+Runs rounds until SIGINT or SIGTERM. `--once` runs a single round and exits. If `listen_addr` is
+set, the listener runs alongside for the whole process. zcrawl binds it before the first round,
+so a port already in use is an error at startup.
 
 On shutdown, the round in progress is marked `interrupted`. If the process dies without warning,
 its round stays `running`. The next `zcrawl run` marks it `interrupted` before starting. A lock
@@ -218,6 +258,16 @@ With `--group-by subnet`, each IPv4 /24 and IPv6 /48 counts once instead of each
 
 Compare this with the per-node curve to see how much a few large operators move the result.
 
+With `--inbound-window-hours N`, each round also counts nodes that dialled the listener between
+N hours before the round started and when it finished:
+- An inbound node counts once per IP, at the latest version it announced in that window.
+- An IP that the round already reached on any port is not counted again.
+- Only completed inbound handshakes count.
+
+Pick N to match how often nodes reconnect to you. Too short misses nodes, and too long counts
+nodes that have gone. `zcrawl status` shows how many nodes dial in per day. Without the flag,
+inbound connections are ignored, and the curve is the reachable-node curve described above.
+
 ### `zcrawl status`
 
 Shows the most recent complete round:
@@ -225,7 +275,12 @@ Shows the most recent complete round:
 - addresses tried and nodes reached;
 - a count per implementation and version;
 - failure reasons for unreachable addresses;
-- any newer round that is still running or was interrupted.
+- any newer round that is still running or was interrupted;
+- if the listener has ever recorded a connection, a summary of the last 24 hours:
+  - inbound connections;
+  - distinct IPs that completed a handshake;
+  - how many of those IPs the last round did not reach (nodes only the listener sees);
+  - each IP's latest implementation and version.
 
 ## Data
 
@@ -255,8 +310,21 @@ this.
 | `observed_at` | When the connection attempt started. |
 
 `addresses` is zcrawl's address book: `address`, `port`, `first_seen`, `last_seen` and
-`last_reachable`. An address counts as seen when a DNS seeder or a peer gives it to us, or when we
-complete a handshake with it.
+`last_reachable`. An address counts as seen in three cases: a DNS seeder or a peer gives it to us,
+we complete a handshake with it, or an inbound peer claims to listen there.
+
+`inbound` has one row per connection accepted by the listener. These rows belong to no round.
+
+| column | |
+|---|---|
+| `address`, `port` | The peer's IP and *source* port. The port is ephemeral, so identify nodes by `address`. |
+| `handshake_complete` | 1 if the peer sent `version` and `verack`. |
+| `failure_reason`, `user_agent_raw`, `implementation`, `version`, `protocol_version`, `start_height`, `services` | As in `observations`. |
+| `claimed_addr` | `addr_from` from the peer's `version`, as `ip:port`, exactly as claimed. Nodes behind NAT usually send `0.0.0.0:0` or their bind address. |
+| `observed_at` | When the connection was accepted. |
+
+The schema version is 2, which added `inbound`. `zcrawl run` upgrades a version 1 database the
+first time it opens it. `status` and `report` refuse a version 1 database until then.
 
 ### User-agent parsing
 
@@ -272,9 +340,16 @@ Examples:
 
 ## Limits of the measurement
 
-- **Reachable nodes only.** Only nodes that accept inbound TCP connections are counted. Nodes
-  behind NAT or firewalls, nodes with `listen_addr` on localhost, and nodes that never appear in
-  gossip or DNS seeds are invisible. Those may be the nodes that upgrade slowest, or fastest.
+- **Reachable nodes only, unless listening.** Without the listener, only nodes that accept
+  inbound TCP connections are counted. Nodes behind NAT or firewalls, nodes with `listen_addr` on
+  localhost, and nodes that never appear in gossip or DNS seeds are invisible. Those may be the
+  nodes that upgrade slowest, or fastest.
+- **The listener sees a sample of hidden nodes.** A node dials us only after it learns our
+  address and picks it from its address book. That takes time after first deployment, and it
+  favours nodes that churn peers often. A node behind NAT counts once per public IP, so several
+  nodes behind one NAT (or carrier-grade NAT) count as one, and a node whose IP changes counts
+  again. How much of the network the listener sees is unknown, so treat inbound counts as a
+  lower bound.
 - **Sybillable.** User agents are self-reported, unauthenticated strings. Anyone can run many
   cheap listeners claiming any version, or gossip fake addresses. That can move the curve in
   either direction. `--group-by subnet` limits, but does not remove, the effect of one operator
@@ -305,12 +380,17 @@ cargo test
   truncation, a user agent over 256 bytes, `addr` count limits, `addrv2` with a Tor address
   that must be dropped, and a small deterministic fuzz loop.
 - `tests/mock_peer.rs`: a mock TCP peer that completes a handshake, pings, and returns two
-  addresses. Also covers a full round in which two mock peers advertise each other and a closed
+  addresses. With the listener on, it also checks the `NODE_NETWORK` announcement and the extra
+  `addr`. Listener tests dial zcrawl as a node would, and check the handshake, the hang-up, the
+  `inbound` row, the claimed port added to the address book, the `status` summary, and
+  self-connection detection. Also covers a full round in which two mock peers advertise each other and a closed
   port (each probed exactly once), a second round seeded only from the address book, peers that
   send a bad checksum, an oversized header, or `version` and then hang up, and a round stopped
   mid-way.
 - `tests/report_fixture.rs`: a fixture database with a known adoption curve, checking 50/80/95%
-  times exactly for every `--denominator` and `--group-by` combination. Its rounds include an
+  times exactly for every `--denominator` and `--group-by` combination. With
+  `--inbound-window-hours`, it checks that hidden nodes are added per IP at their latest version,
+  and that nodes the round already reached are not counted twice. Its rounds include an
   interrupted one, a still-running one and a pre-release one, all of which must be excluded.
 
 ### Manual check: one round against testnet
@@ -408,7 +488,9 @@ counted.
 10. **`--group-by subnet`** counts a subnet as upgraded only when *every* counted node in it is
     upgraded. Alternatives would be "any node" or "majority".
 11. **Handshake fields.** zcrawl advertises protocol 170190 on both networks (as Zebra and Zakura
-    do), services 0, `relay = false` and `start_height = 0`. It does not send `sendaddrv2`.
+    do), `relay = false` and `start_height = 0`, and does not send `sendaddrv2`. Services are 0,
+    or `NODE_NETWORK` while listening. Every `version` from one process carries the same nonce,
+    so the crawler and the listener can recognise each other.
 12. **`getaddr` handling.** zcrawl waits up to 10 s for an `addr` with more than one entry, and
     takes at most 1000 addresses per peer per round.
 13. **Report layout.** Threshold times are printed after the CSV as `#` comment lines on stdout.

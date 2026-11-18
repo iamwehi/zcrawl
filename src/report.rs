@@ -4,8 +4,13 @@
 //! reachable nodes in the denominator set and how many of them run the release
 //! or a later version. Rounds still running, interrupted, or started before
 //! the release are left out.
+//!
+//! With an inbound window, each round also counts the nodes that dialled the
+//! listener from `window` before the round started until it finished, one per
+//! IP, at the latest version each announced, unless the round already reached
+//! that IP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::IpAddr;
 
@@ -39,6 +44,9 @@ pub struct ReportParams {
     pub released_at: i64,
     pub denominator: Denominator,
     pub group_by: GroupBy,
+    /// Also count inbound nodes seen this many seconds before each round.
+    /// `None` counts reachable nodes only.
+    pub inbound_window_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,15 +88,63 @@ struct Tally {
     subnets: HashMap<String, bool>,
 }
 
+impl Tally {
+    /// Count one node if it is in the denominator set.
+    fn add(
+        &mut self,
+        p: &ReportParams,
+        address: &str,
+        implementation: Option<&str>,
+        version: Option<&str>,
+    ) {
+        let same_impl = implementation == Some(p.implementation.as_str());
+        let counted = match p.denominator {
+            Denominator::Implementation => same_impl,
+            Denominator::All => true,
+        };
+        if !counted {
+            return;
+        }
+        let upgraded = same_impl
+            && version
+                .and_then(|v| v.parse::<NodeVersion>().ok())
+                .is_some_and(|v| v >= p.version);
+        match p.group_by {
+            GroupBy::Node => {
+                self.total += 1;
+                self.upgraded += u64::from(upgraded);
+            }
+            GroupBy::Subnet => {
+                // Stored addresses are always valid IP literals.
+                let Ok(ip) = address.parse::<IpAddr>() else {
+                    return;
+                };
+                let all_upgraded = self.subnets.entry(subnet_key(ip)).or_insert(true);
+                *all_upgraded &= upgraded;
+            }
+        }
+    }
+}
+
+/// One completed inbound handshake.
+struct InboundRow {
+    address: String,
+    implementation: Option<String>,
+    version: Option<String>,
+    observed_at: i64,
+}
+
 pub fn compute(conn: &Connection, p: &ReportParams) -> anyhow::Result<Report> {
     let mut rounds_stmt = conn.prepare(
-        "SELECT id, started_at FROM rounds
+        "SELECT id, started_at, finished_at FROM rounds
          WHERE status = 'complete' AND started_at >= ?1
          ORDER BY started_at, id",
     )?;
-    let rounds: Vec<(i64, i64)> = rounds_stmt
-        .query_map([p.released_at], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let rounds: Vec<(i64, i64, i64)> = rounds_stmt
+        .query_map([p.released_at], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<_, _>>()?;
+    // IPs each round reached, so inbound nodes are not counted twice.
+    let mut reached_ips: HashMap<i64, HashSet<String>> = HashMap::new();
 
     let mut tallies: HashMap<i64, Tally> = HashMap::new();
     let mut obs_stmt = conn.prepare(
@@ -97,47 +153,55 @@ pub fn compute(conn: &Connection, p: &ReportParams) -> anyhow::Result<Report> {
          WHERE r.status = 'complete' AND r.started_at >= ?1 AND o.reachable = 1",
     )?;
     let mut rows = obs_stmt.query([p.released_at])?;
-    let target_impl = p.implementation.as_str();
     while let Some(row) = rows.next()? {
         let round_id: i64 = row.get(0)?;
         let address: String = row.get(1)?;
         let implementation: Option<String> = row.get(2)?;
         let version: Option<String> = row.get(3)?;
-
-        let same_impl = implementation.as_deref() == Some(target_impl);
-        let counted = match p.denominator {
-            Denominator::Implementation => same_impl,
-            Denominator::All => true,
-        };
-        if !counted {
-            continue;
+        tallies.entry(round_id).or_default().add(
+            p,
+            &address,
+            implementation.as_deref(),
+            version.as_deref(),
+        );
+        if p.inbound_window_secs.is_some() {
+            reached_ips.entry(round_id).or_default().insert(address);
         }
-        let upgraded = same_impl
-            && version
-                .as_deref()
-                .and_then(|v| v.parse::<NodeVersion>().ok())
-                .is_some_and(|v| v >= p.version);
+    }
 
-        let tally = tallies.entry(round_id).or_default();
-        match p.group_by {
-            GroupBy::Node => {
-                tally.total += 1;
-                tally.upgraded += u64::from(upgraded);
+    if let (Some(window), Some(first), Some(last)) =
+        (p.inbound_window_secs, rounds.first(), rounds.last())
+    {
+        let inbound = inbound_rows(conn, first.1 - window, last.2)?;
+        let no_ips = HashSet::new();
+        for &(round_id, started_at, finished_at) in &rounds {
+            let from = inbound.partition_point(|r| r.observed_at < started_at - window);
+            // Rows are in time order, so the last one per IP is its latest.
+            let mut latest: HashMap<&str, &InboundRow> = HashMap::new();
+            for r in inbound[from..]
+                .iter()
+                .take_while(|r| r.observed_at <= finished_at)
+            {
+                latest.insert(&r.address, r);
             }
-            GroupBy::Subnet => {
-                // Stored addresses are always valid IP literals.
-                let Ok(ip) = address.parse::<IpAddr>() else {
-                    continue;
-                };
-                let all_upgraded = tally.subnets.entry(subnet_key(ip)).or_insert(true);
-                *all_upgraded &= upgraded;
+            let reached = reached_ips.get(&round_id).unwrap_or(&no_ips);
+            let tally = tallies.entry(round_id).or_default();
+            for (address, r) in latest {
+                if !reached.contains(address) {
+                    tally.add(
+                        p,
+                        address,
+                        r.implementation.as_deref(),
+                        r.version.as_deref(),
+                    );
+                }
             }
         }
     }
 
     let points: Vec<CurvePoint> = rounds
         .into_iter()
-        .map(|(round_id, started_at)| {
+        .map(|(round_id, started_at, _)| {
             let t = tallies.remove(&round_id).unwrap_or_default();
             let (upgraded, total) = match p.group_by {
                 GroupBy::Node => (t.upgraded, t.total),
@@ -160,6 +224,26 @@ pub fn compute(conn: &Connection, p: &ReportParams) -> anyhow::Result<Report> {
         (pct, first.map(|pt| pt.secs_since_release))
     });
     Ok(Report { points, time_to })
+}
+
+/// Completed inbound handshakes observed in `[from, to]`, oldest first.
+fn inbound_rows(conn: &Connection, from: i64, to: i64) -> anyhow::Result<Vec<InboundRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT address, implementation, version, observed_at FROM inbound
+         WHERE handshake_complete = 1 AND observed_at BETWEEN ?1 AND ?2
+         ORDER BY observed_at, id",
+    )?;
+    let rows = stmt
+        .query_map([from, to], |r| {
+            Ok(InboundRow {
+                address: r.get(0)?,
+                implementation: r.get(1)?,
+                version: r.get(2)?,
+                observed_at: r.get(3)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
 }
 
 fn hours(secs: i64) -> String {

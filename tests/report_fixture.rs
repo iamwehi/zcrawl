@@ -67,9 +67,13 @@ fn zebra_address(node: u32) -> String {
 }
 
 fn fixture() -> Connection {
+    // Tests run in parallel and macOS clocks tick in microseconds, so the
+    // time alone does not make the directory unique.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "zcrawl-report-{}-{}",
+        "zcrawl-report-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -147,6 +151,7 @@ fn params(denominator: Denominator, group_by: GroupBy) -> ReportParams {
         released_at: T,
         denominator,
         group_by,
+        inbound_window_secs: None,
     }
 }
 
@@ -290,4 +295,93 @@ fn release_after_all_rounds_has_empty_curve() {
     let rep = report::compute(&fixture(), &p).unwrap();
     assert!(rep.points.is_empty());
     assert_eq!(rep.time_to, [(50, None), (80, None), (95, None)]);
+}
+
+/// Inbound sightings on top of the fixture, counted with a 6 hour window.
+///
+/// - Hidden Zebra node 198.18.0.1 dials in at T+5h on 2.5.0 and at T+11h30m
+///   on 2.6.0. Round 2 (window T..T+6h30m) counts it as not upgraded, round 3
+///   (T+6h..T+12h30m) as upgraded, and later rounds not at all.
+/// - Node 1 (203.0.1.1) also dials in, at T+6h10m announcing 2.6.0. Round 2
+///   already reached that IP, so it is not counted twice.
+/// - 198.18.0.2 never completes its handshake, and a hidden Zakura node
+///   only counts in the `all` denominator.
+fn with_inbound() -> Connection {
+    let conn = fixture();
+    type Row = (
+        &'static str,
+        bool,
+        Option<&'static str>,
+        Option<&'static str>,
+        i64,
+    );
+    let rows: [Row; 5] = [
+        ("198.18.0.1", true, Some("zebra"), Some("2.5.0"), T + 5 * H),
+        (
+            "198.18.0.1",
+            true,
+            Some("zebra"),
+            Some("2.6.0"),
+            T + 11 * H + 1800,
+        ),
+        (
+            "203.0.1.1",
+            true,
+            Some("zebra"),
+            Some("2.6.0"),
+            T + 6 * H + 600,
+        ),
+        ("198.18.0.2", false, None, None, T + 6 * H),
+        (
+            "2001:db8:9::1",
+            true,
+            Some("zakura"),
+            Some("1.8.9"),
+            T + 6 * H,
+        ),
+    ];
+    for (address, done, implementation, version, at) in rows {
+        conn.execute(
+            "INSERT INTO inbound (address, port, handshake_complete, implementation, version,
+                 observed_at)
+             VALUES (?1, 50000, ?2, ?3, ?4, ?5)",
+            params![address, done, implementation, version, at],
+        )
+        .unwrap();
+    }
+    conn
+}
+
+#[test]
+fn inbound_window_adds_hidden_nodes_once() {
+    let conn = with_inbound();
+    let mut p = params(Denominator::Implementation, GroupBy::Node);
+    // Without a window, inbound rows change nothing.
+    assert_eq!(
+        curve(&report::compute(&conn, &p).unwrap().points),
+        vec![
+            (6, 3, 20),
+            (12, 8, 20),
+            (24, 10, 20),
+            (48, 16, 20),
+            (72, 19, 20)
+        ]
+    );
+    p.inbound_window_secs = Some(6 * H);
+    assert_eq!(
+        curve(&report::compute(&conn, &p).unwrap().points),
+        vec![
+            (6, 3, 21),
+            (12, 9, 21),
+            (24, 10, 20),
+            (48, 16, 20),
+            (72, 19, 20)
+        ]
+    );
+
+    let mut p = params(Denominator::All, GroupBy::Node);
+    p.inbound_window_secs = Some(6 * H);
+    let points = report::compute(&conn, &p).unwrap().points;
+    // 26 reachable, plus the hidden Zebra and Zakura nodes.
+    assert_eq!((points[0].upgraded, points[0].total), (3, 28));
 }

@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::db::{self, AddressSighting, Db, Observation};
+use crate::listener::{self, ListenerConfig};
 use crate::netaddr;
 use crate::params;
 use crate::peer::{self, ProbeConfig, ProbeResult, unix_now};
@@ -40,7 +41,22 @@ pub struct RoundSummary {
     pub duration: Duration,
 }
 
-/// `zcrawl run`: crawl rounds on a timer until SIGINT or SIGTERM.
+/// Every connection setting, outbound and inbound, from the config.
+pub fn probe_config(cfg: &Config) -> ProbeConfig {
+    ProbeConfig {
+        magic: cfg.network.magic(),
+        protocol_version: cfg.protocol_version(),
+        user_agent: params::user_agent(),
+        connect_timeout: Duration::from_secs(cfg.connect_timeout_secs),
+        handshake_timeout: Duration::from_secs(cfg.handshake_timeout_secs),
+        getaddr_timeout: Duration::from_secs(cfg.getaddr_timeout_secs),
+        max_addrs: cfg.max_addrs_per_peer,
+        announce: cfg.announce_addr(),
+    }
+}
+
+/// `zcrawl run`: crawl rounds on a timer until SIGINT or SIGTERM, with the
+/// listener running alongside if `listen_addr` is set.
 pub async fn run(cfg: Config, once: bool) -> anyhow::Result<()> {
     let _lock = lock_database(&cfg.database)?;
     let conn = db::open(&cfg.database)?;
@@ -53,6 +69,12 @@ pub async fn run(cfg: Config, once: bool) -> anyhow::Result<()> {
         );
     }
     let db = Db::new(conn);
+
+    // Bind before the first round, so a taken port fails at startup.
+    let listening = match cfg.listen_addr {
+        Some(addr) => Some(listener::bind(addr).await?),
+        None => None,
+    };
 
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -68,6 +90,21 @@ pub async fn run(cfg: Config, once: bool) -> anyhow::Result<()> {
         protocol_version = cfg.protocol_version(),
         "zcrawl starting"
     );
+
+    let (listen_stop_tx, listen_stop_rx) = watch::channel(false);
+    let listener_task = listening.map(|l| {
+        info!(
+            listen_addr = ?l.local_addr().ok(),
+            announced = ?cfg.announce_addr(),
+            "listening for inbound connections"
+        );
+        let lcfg = ListenerConfig {
+            probe: Arc::new(probe_config(&cfg)),
+            max_connections: cfg.max_inbound_connections,
+            allow_non_routable: cfg.allow_non_routable,
+        };
+        tokio::spawn(listener::serve(l, lcfg, db.clone(), listen_stop_rx))
+    });
 
     let mut ticker = tokio::time::interval(cfg.round_interval());
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -94,6 +131,15 @@ pub async fn run(cfg: Config, once: bool) -> anyhow::Result<()> {
         }
         if once || *stop.borrow() {
             break;
+        }
+    }
+
+    let _ = listen_stop_tx.send(true);
+    if let Some(task) = listener_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!(error = format!("{e:#}"), "listener failed"),
+            Err(e) => error!(error = %e, "listener task failed"),
         }
     }
     Ok(())
@@ -207,13 +253,15 @@ pub async fn run_round(
 /// Addresses waiting to be crawled and everything already queued this round.
 struct Frontier {
     allow_non_routable: bool,
+    /// Our own announced address, which peers will gossip back to us.
+    ours: Option<SocketAddr>,
     seen: HashSet<SocketAddr>,
     queue: VecDeque<SocketAddr>,
 }
 
 impl Frontier {
     fn accepts(&self, addr: SocketAddr) -> bool {
-        self.allow_non_routable || netaddr::is_crawlable(addr)
+        Some(addr) != self.ours && (self.allow_non_routable || netaddr::is_crawlable(addr))
     }
 
     /// Queue `addr` unless it was already queued this round.
@@ -266,17 +314,10 @@ async fn crawl(
     deadline: Instant,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<CrawlEnd> {
-    let probe_cfg = Arc::new(ProbeConfig {
-        magic: cfg.network.magic(),
-        protocol_version: cfg.protocol_version(),
-        user_agent: params::user_agent(),
-        connect_timeout: Duration::from_secs(cfg.connect_timeout_secs),
-        handshake_timeout: Duration::from_secs(cfg.handshake_timeout_secs),
-        getaddr_timeout: Duration::from_secs(cfg.getaddr_timeout_secs),
-        max_addrs: cfg.max_addrs_per_peer,
-    });
+    let probe_cfg = Arc::new(probe_config(cfg));
     let mut frontier = Frontier {
         allow_non_routable: cfg.allow_non_routable,
+        ours: cfg.announce_addr(),
         seen: HashSet::new(),
         queue: VecDeque::new(),
     };

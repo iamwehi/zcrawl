@@ -8,6 +8,9 @@
 //! the process dies, the row stays `running`; the next `zcrawl run` changes it to
 //! `interrupted`. Reports and `status` read `complete` rounds only, so a crash
 //! never leaves half a round in the results.
+//!
+//! Inbound connections to the listener are not part of any round. They are
+//! written to `inbound` as they finish.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -20,7 +23,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::params::Network;
 
-const SCHEMA_VERSION: i64 = 1;
+/// 1: rounds, observations, addresses. 2: adds `inbound`. Opening a version 1
+/// database for writing upgrades it in place.
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -71,6 +76,26 @@ CREATE TABLE IF NOT EXISTS addresses (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS addresses_last_seen ON addresses (last_seen);
+
+CREATE TABLE IF NOT EXISTS inbound (
+    id                 INTEGER PRIMARY KEY,
+    address            TEXT NOT NULL,
+    -- The peer's source port: ephemeral, not where it listens.
+    port               INTEGER NOT NULL,
+    handshake_complete INTEGER NOT NULL,
+    failure_reason     TEXT,
+    user_agent_raw     BLOB,
+    implementation     TEXT,
+    version            TEXT,
+    protocol_version   INTEGER,
+    start_height       INTEGER,
+    services           INTEGER,
+    -- `addr_from` from the peer's version, as `ip:port` exactly as claimed.
+    claimed_addr       TEXT,
+    observed_at        INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS inbound_observed_at ON inbound (observed_at);
 ";
 
 /// One connection attempt, as stored in `observations`.
@@ -88,6 +113,14 @@ pub struct Observation {
     pub start_height: Option<i32>,
     pub services: Option<u64>,
     pub observed_at: i64,
+}
+
+/// A connection a peer opened to our listener, as stored in `inbound`.
+/// `obs.reachable` holds `handshake_complete`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundObservation {
+    pub obs: Observation,
+    pub claimed_addr: Option<SocketAddr>,
 }
 
 /// An address learned from DNS or `addr`, or reached by us.
@@ -128,8 +161,14 @@ pub fn open_read_only(path: &Path) -> anyhow::Result<Connection> {
     .with_context(|| format!("opening database {}", path.display()))?;
     configure(&conn)?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version != SCHEMA_VERSION {
-        bail!("database schema version is {version}, expected {SCHEMA_VERSION}");
+    if version < SCHEMA_VERSION {
+        bail!(
+            "database schema version is {version}, expected {SCHEMA_VERSION}; \
+             restart `zcrawl run` with this build once to upgrade it"
+        );
+    }
+    if version > SCHEMA_VERSION {
+        bail!("database schema version {version} is newer than this zcrawl ({SCHEMA_VERSION})");
     }
     Ok(conn)
 }
@@ -205,20 +244,13 @@ fn insert_observations(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
     for o in observations {
-        let ua = match &o.user_agent_raw {
-            None => Value::Null,
-            Some(bytes) => match std::str::from_utf8(bytes) {
-                Ok(s) => Value::Text(s.to_owned()),
-                Err(_) => Value::Blob(bytes.clone()),
-            },
-        };
         stmt.execute(params![
             round_id,
             o.addr.ip().to_string(),
             o.addr.port(),
             o.reachable,
             o.failure_reason,
-            ua,
+            user_agent_value(&o.user_agent_raw),
             o.implementation,
             o.version,
             o.protocol_version,
@@ -228,6 +260,55 @@ fn insert_observations(
             o.observed_at,
         ])?;
     }
+    Ok(())
+}
+
+/// TEXT if the bytes are valid UTF-8, BLOB otherwise.
+fn user_agent_value(raw: &Option<Vec<u8>>) -> Value {
+    match raw {
+        None => Value::Null,
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => Value::Text(s.to_owned()),
+            Err(_) => Value::Blob(bytes.clone()),
+        },
+    }
+}
+
+/// Store inbound connections and the listening addresses they claimed, in one
+/// transaction.
+pub fn record_inbound(
+    conn: &mut Connection,
+    inbound: &[InboundObservation],
+    sightings: &[AddressSighting],
+) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO inbound (address, port, handshake_complete, failure_reason,
+                 user_agent_raw, implementation, version, protocol_version, start_height,
+                 services, claimed_addr, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        )?;
+        for i in inbound {
+            let o = &i.obs;
+            stmt.execute(params![
+                o.addr.ip().to_string(),
+                o.addr.port(),
+                o.reachable,
+                o.failure_reason,
+                user_agent_value(&o.user_agent_raw),
+                o.implementation,
+                o.version,
+                o.protocol_version,
+                o.start_height,
+                o.services.map(|s| s as i64),
+                i.claimed_addr.map(|a| a.to_string()),
+                o.observed_at,
+            ])?;
+        }
+    }
+    upsert_addresses(&tx, sightings)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -483,6 +564,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!((last_seen, last_reachable), (10, Some(10)));
+    }
+
+    #[test]
+    fn version_1_database_is_upgraded_on_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "zcrawl-db-upgrade-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v1.sqlite");
+        {
+            // A version 1 database: everything but `inbound`.
+            let conn = Connection::open(&path).unwrap();
+            let v1 = SCHEMA
+                .split("CREATE TABLE IF NOT EXISTS inbound")
+                .next()
+                .unwrap();
+            conn.execute_batch(v1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let err = open_read_only(&path).unwrap_err().to_string();
+        assert!(err.contains("restart `zcrawl run`"), "{err}");
+        drop(open(&path).unwrap());
+        let conn = open_read_only(&path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM inbound", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn inbound_rows_and_claimed_addresses() {
+        let mut conn = mem();
+        let mut o = obs("1.2.3.4:51234", true, Some(b"/Zebra:7.1.0/"));
+        o.implementation = Some("zebra".into());
+        let i = InboundObservation {
+            obs: o,
+            claimed_addr: Some("[::]:8233".parse().unwrap()),
+        };
+        let s = AddressSighting {
+            addr: "1.2.3.4:8233".parse().unwrap(),
+            seen_at: 100,
+            reachable: false,
+        };
+        record_inbound(&mut conn, &[i], &[s]).unwrap();
+        let (port, claimed, done): (u16, String, bool) = conn
+            .query_row(
+                "SELECT port, claimed_addr, handshake_complete FROM inbound",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((port, claimed.as_str(), done), (51234, "[::]:8233", true));
+        assert_eq!(
+            known_addresses(&conn, 0).unwrap(),
+            vec!["1.2.3.4:8233".parse().unwrap()]
+        );
     }
 
     #[test]

@@ -1,11 +1,13 @@
 //! TOML configuration.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
+use crate::netaddr;
 use crate::params::{self, Network};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +39,14 @@ pub struct Config {
     pub protocol_version: Option<u32>,
     /// Crawl private, loopback and other non-global addresses. For tests only.
     pub allow_non_routable: bool,
+    /// Accept inbound connections on this address, e.g. `[::]:8233`. Unset
+    /// means zcrawl only crawls. Requires `external_addr`.
+    pub listen_addr: Option<SocketAddr>,
+    /// The public `ip:port` other nodes can reach the listener on. It is
+    /// announced to every crawled peer.
+    pub external_addr: Option<SocketAddr>,
+    /// Maximum simultaneous inbound connections. Extra ones are dropped.
+    pub max_inbound_connections: usize,
 }
 
 impl Default for Config {
@@ -56,6 +66,9 @@ impl Default for Config {
             extra_peers: Vec::new(),
             protocol_version: None,
             allow_non_routable: false,
+            listen_addr: None,
+            external_addr: None,
+            max_inbound_connections: 64,
         }
     }
 }
@@ -95,6 +108,21 @@ impl Config {
         if self.address_retention_days > 3650 {
             bail!("address_retention_days must be at most 3650");
         }
+        match (self.listen_addr, self.external_addr) {
+            (Some(_), None) => {
+                bail!("listen_addr needs external_addr, the public ip:port other nodes can reach")
+            }
+            (None, Some(_)) => bail!("external_addr is only used together with listen_addr"),
+            (Some(_), Some(ext)) => {
+                if !self.allow_non_routable && !netaddr::is_crawlable(ext) {
+                    bail!("external_addr {ext} is not a public address other nodes can reach");
+                }
+                if self.max_inbound_connections == 0 || self.max_inbound_connections > 4096 {
+                    bail!("max_inbound_connections must be between 1 and 4096");
+                }
+            }
+            (None, None) => {}
+        }
         Ok(())
     }
 
@@ -112,6 +140,13 @@ impl Config {
 
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version.unwrap_or(params::PROTOCOL_VERSION)
+    }
+
+    /// The address announced to peers, if the listener is enabled.
+    pub fn announce_addr(&self) -> Option<SocketAddr> {
+        self.listen_addr
+            .and(self.external_addr)
+            .map(netaddr::normalize)
     }
 
     pub fn round_interval(&self) -> Duration {
@@ -158,6 +193,24 @@ mod tests {
         assert!(toml::from_str::<Config>("netwrok = \"testnet\"").is_err());
         let c: Config = toml::from_str("max_connections = 0").unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn listener_needs_a_public_external_addr() {
+        let c: Config = toml::from_str("listen_addr = \"[::]:8233\"").unwrap();
+        assert!(c.validate().is_err());
+        let c: Config = toml::from_str("external_addr = \"203.0.114.1:8233\"").unwrap();
+        assert!(c.validate().is_err());
+        let c: Config =
+            toml::from_str("listen_addr = \"[::]:8233\"\nexternal_addr = \"192.168.1.2:8233\"")
+                .unwrap();
+        assert!(c.validate().is_err());
+        let c: Config =
+            toml::from_str("listen_addr = \"[::]:8233\"\nexternal_addr = \"8.8.8.8:8233\"")
+                .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.announce_addr(), Some("8.8.8.8:8233".parse().unwrap()));
+        assert_eq!(Config::default().announce_addr(), None);
     }
 
     #[test]

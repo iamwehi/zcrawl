@@ -14,6 +14,14 @@ use serde::Deserialize;
 /// Zebra and Zakura advertise this one value on both Mainnet and Testnet.
 pub const PROTOCOL_VERSION: u32 = 170_190;
 
+/// Service bit for a full node that serves blocks.
+///
+/// `zebra-network/src/protocol/external/types.rs`: `PeerServices::NODE_NETWORK`.
+/// Zebra only dials gossiped addresses whose services include it
+/// (`zebra-network/src/meta_addr.rs`: `last_known_info_is_valid_for_outbound`),
+/// so zcrawl advertises it while listening, even though it serves no blocks.
+pub const NODE_NETWORK: u64 = 1;
+
 /// Largest message payload Zebra accepts.
 ///
 /// `zebra-chain/src/serialization/zcash_serialize.rs`: `MAX_PROTOCOL_MESSAGE_LEN`.

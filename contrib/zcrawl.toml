@@ -38,3 +38,13 @@ extra_peers = []
 # Protocol version sent in our version message. Defaults to 170190, Zebra's
 # current CURRENT_NETWORK_PROTOCOL_VERSION. Change only if Zebra changes it.
 # protocol_version = 170190
+
+# Listener (off by default). Nodes behind NAT or firewalls never accept
+# connections, so the crawler cannot see them, but they dial out to addresses
+# they learn from gossip. With both keys set, zcrawl listens on listen_addr and
+# announces external_addr to every crawled peer, advertising NODE_NETWORK so
+# that Zebra will dial it. It answers each handshake, records the peer's
+# version, and hangs up. The port must be reachable from the internet.
+# listen_addr = "[::]:8233"
+# external_addr = "203.0.113.10:8233"   # this server's public IP
+# max_inbound_connections = 64

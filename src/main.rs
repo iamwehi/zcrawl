@@ -55,6 +55,10 @@ enum Command {
         /// Count each node, or each IPv4 /24 and IPv6 /48, once.
         #[arg(long, value_enum, default_value_t = GroupByArg::Node)]
         group_by: GroupByArg,
+        /// Also count nodes that dialled the listener up to this many hours
+        /// before each round, one per IP, unless the round reached that IP.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=24 * 365))]
+        inbound_window_hours: Option<u32>,
     },
     /// Summarise the last complete round.
     Status,
@@ -141,6 +145,7 @@ fn real_main(cli: Cli) -> anyhow::Result<()> {
             released_at,
             denominator,
             group_by,
+            inbound_window_hours,
         } => {
             let conn = db::open_read_only(&config.database)?;
             let params = ReportParams {
@@ -158,6 +163,7 @@ fn real_main(cli: Cli) -> anyhow::Result<()> {
                     GroupByArg::Node => GroupBy::Node,
                     GroupByArg::Subnet => GroupBy::Subnet,
                 },
+                inbound_window_secs: inbound_window_hours.map(|h| i64::from(h) * 3600),
             };
             let rep = report::compute(&conn, &params)?;
             let mut out = std::io::stdout().lock();

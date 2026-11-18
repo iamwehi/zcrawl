@@ -1,4 +1,5 @@
-//! `zcrawl status`: a summary of the most recent complete round.
+//! `zcrawl status`: a summary of the most recent complete round, and of the
+//! nodes that dialled the listener in the last day.
 
 use std::cmp::Reverse;
 use std::io::{self, Write};
@@ -7,7 +8,11 @@ use rusqlite::{Connection, OptionalExtension};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::peer::unix_now;
 use crate::user_agent::NodeVersion;
+
+/// `status` summarises inbound connections from this far back.
+pub const INBOUND_WINDOW_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundRow {
@@ -29,6 +34,22 @@ pub struct Status {
     pub versions: Vec<(String, String, u64)>,
     /// (failure reason, count) for unreachable addresses.
     pub failures: Vec<(String, u64)>,
+    /// Inbound connections in the last [`INBOUND_WINDOW_SECS`], or `None` if
+    /// the listener has never recorded one.
+    pub inbound: Option<InboundSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundSummary {
+    /// Connections accepted, including ones that never completed a handshake.
+    pub connections: u64,
+    /// Distinct IPs that completed a handshake.
+    pub nodes: u64,
+    /// Of `nodes`, how many IPs the last complete round did not reach on any
+    /// port: nodes only the listener sees. `None` without a complete round.
+    pub not_crawled: Option<u64>,
+    /// (implementation, version, IPs), using each IP's latest handshake.
+    pub versions: Vec<(String, String, u64)>,
 }
 
 fn round_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RoundRow> {
@@ -47,6 +68,71 @@ const ROUND_COLUMNS: &str =
     "id, started_at, finished_at, status, hit_time_limit, addresses_tried, nodes_reached";
 
 pub fn compute(conn: &Connection) -> anyhow::Result<Status> {
+    compute_at(conn, unix_now())
+}
+
+/// By implementation, then newest version first.
+fn sort_versions(versions: &mut [(String, String, u64)]) {
+    versions.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| {
+            let va = a.1.parse::<NodeVersion>().ok();
+            let vb = b.1.parse::<NodeVersion>().ok();
+            Reverse(va).cmp(&Reverse(vb)).then_with(|| a.1.cmp(&b.1))
+        })
+    });
+}
+
+fn inbound_summary(
+    conn: &Connection,
+    since: i64,
+    last_round: Option<i64>,
+) -> anyhow::Result<Option<InboundSummary>> {
+    let ever: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM inbound)", [], |r| r.get(0))?;
+    if !ever {
+        return Ok(None);
+    }
+    let (connections, nodes): (i64, i64) = conn.query_row(
+        "SELECT count(*), count(DISTINCT CASE WHEN handshake_complete = 1 THEN address END)
+         FROM inbound WHERE observed_at >= ?1",
+        [since],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let not_crawled = match last_round {
+        None => None,
+        Some(round_id) => Some(crate::db::count(conn.query_row(
+            "SELECT count(DISTINCT address) FROM inbound
+             WHERE handshake_complete = 1 AND observed_at >= ?1
+               AND address NOT IN (SELECT address FROM observations
+                                   WHERE round_id = ?2 AND reachable = 1)",
+            [since, round_id],
+            |r| r.get(0),
+        )?)),
+    };
+    let mut stmt = conn.prepare(
+        "WITH latest AS (
+             SELECT implementation, version,
+                    row_number() OVER (PARTITION BY address
+                                       ORDER BY observed_at DESC, id DESC) AS rn
+             FROM inbound WHERE handshake_complete = 1 AND observed_at >= ?1)
+         SELECT coalesce(implementation, 'unknown'), coalesce(version, '-'), count(*)
+         FROM latest WHERE rn = 1 GROUP BY 1, 2",
+    )?;
+    let mut versions = stmt
+        .query_map([since], |r| {
+            Ok((r.get(0)?, r.get(1)?, crate::db::count(r.get(2)?)))
+        })?
+        .collect::<Result<Vec<(String, String, u64)>, _>>()?;
+    sort_versions(&mut versions);
+    Ok(Some(InboundSummary {
+        connections: crate::db::count(connections),
+        nodes: crate::db::count(nodes),
+        not_crawled,
+        versions,
+    }))
+}
+
+/// [`compute`] with the inbound window ending at `now`.
+pub fn compute_at(conn: &Connection, now: i64) -> anyhow::Result<Status> {
     let last_complete = conn
         .query_row(
             &format!(
@@ -82,14 +168,7 @@ pub fn compute(conn: &Connection) -> anyhow::Result<Status> {
                 Ok((r.get(0)?, r.get(1)?, crate::db::count(r.get(2)?)))
             })?
             .collect::<Result<Vec<(String, String, u64)>, _>>()?;
-        // By implementation, then newest version first.
-        versions.sort_by(|a, b| {
-            a.0.cmp(&b.0).then_with(|| {
-                let va = a.1.parse::<NodeVersion>().ok();
-                let vb = b.1.parse::<NodeVersion>().ok();
-                Reverse(va).cmp(&Reverse(vb)).then_with(|| a.1.cmp(&b.1))
-            })
-        });
+        sort_versions(&mut versions);
 
         let mut stmt = conn.prepare(
             "SELECT coalesce(failure_reason, 'none'), count(*)
@@ -100,11 +179,17 @@ pub fn compute(conn: &Connection) -> anyhow::Result<Status> {
             .query_map([round.id], |r| Ok((r.get(0)?, crate::db::count(r.get(1)?))))?
             .collect::<Result<_, _>>()?;
     }
+    let inbound = inbound_summary(
+        conn,
+        now - INBOUND_WINDOW_SECS,
+        last_complete.as_ref().map(|r| r.id),
+    )?;
     Ok(Status {
         last_complete,
         newer_incomplete,
         versions,
         failures,
+        inbound,
     })
 }
 
@@ -120,7 +205,56 @@ fn format_duration(secs: i64) -> String {
     format!("{}m {:02}s", secs / 60, secs % 60)
 }
 
+fn write_versions(out: &mut impl Write, versions: &[(String, String, u64)]) -> io::Result<()> {
+    writeln!(
+        out,
+        "{:<14} {:<22} {:>6}",
+        "implementation", "version", "nodes"
+    )?;
+    let mut current_impl: Option<&str> = None;
+    let mut impl_total = 0u64;
+    for (imp, ver, n) in versions {
+        if current_impl.is_some_and(|c| c != imp) {
+            writeln!(out, "{:<14} {:<22} {:>6}", "", "(total)", impl_total)?;
+            impl_total = 0;
+        }
+        current_impl = Some(imp);
+        impl_total += n;
+        writeln!(out, "{imp:<14} {ver:<22} {n:>6}")?;
+    }
+    if current_impl.is_some() {
+        writeln!(out, "{:<14} {:<22} {:>6}", "", "(total)", impl_total)?;
+    }
+    Ok(())
+}
+
+fn write_inbound(out: &mut impl Write, inbound: &Option<InboundSummary>) -> io::Result<()> {
+    let Some(i) = inbound else {
+        return Ok(());
+    };
+    writeln!(out)?;
+    writeln!(out, "Inbound, last 24 hours:")?;
+    writeln!(out, "  connections:     {}", i.connections)?;
+    writeln!(out, "  nodes (by IP):   {}", i.nodes)?;
+    if let Some(n) = i.not_crawled {
+        writeln!(
+            out,
+            "  not crawled:     {n} (not reached by the last round)"
+        )?;
+    }
+    if !i.versions.is_empty() {
+        writeln!(out)?;
+        write_versions(out, &i.versions)?;
+    }
+    Ok(())
+}
+
 pub fn write(status: &Status, out: &mut impl Write) -> io::Result<()> {
+    write_round(status, out)?;
+    write_inbound(out, &status.inbound)
+}
+
+fn write_round(status: &Status, out: &mut impl Write) -> io::Result<()> {
     let Some(r) = &status.last_complete else {
         writeln!(out, "No complete round yet.")?;
         if let Some(inc) = &status.newer_incomplete {
@@ -154,25 +288,7 @@ pub fn write(status: &Status, out: &mut impl Write) -> io::Result<()> {
     }
 
     writeln!(out)?;
-    writeln!(
-        out,
-        "{:<14} {:<22} {:>6}",
-        "implementation", "version", "nodes"
-    )?;
-    let mut current_impl: Option<&str> = None;
-    let mut impl_total = 0u64;
-    for (imp, ver, n) in &status.versions {
-        if current_impl.is_some_and(|c| c != imp) {
-            writeln!(out, "{:<14} {:<22} {:>6}", "", "(total)", impl_total)?;
-            impl_total = 0;
-        }
-        current_impl = Some(imp);
-        impl_total += n;
-        writeln!(out, "{imp:<14} {ver:<22} {n:>6}")?;
-    }
-    if current_impl.is_some() {
-        writeln!(out, "{:<14} {:<22} {:>6}", "", "(total)", impl_total)?;
-    }
+    write_versions(out, &status.versions)?;
 
     if !status.failures.is_empty() {
         writeln!(out)?;

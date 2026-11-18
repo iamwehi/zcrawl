@@ -14,6 +14,7 @@ use zcrawl::codec::{self, AddrEntry, Message, NetAddr, VersionMessage};
 use zcrawl::config::Config;
 use zcrawl::crawler::{self, RoundStatus};
 use zcrawl::db::{self, Db};
+use zcrawl::listener::{self, ListenerConfig};
 use zcrawl::params::{self, Network};
 use zcrawl::peer::{self, ProbeConfig};
 use zcrawl::status;
@@ -43,6 +44,8 @@ struct Seen {
     got_verack: bool,
     got_pong: bool,
     got_getaddr: bool,
+    /// Entries of `addr` messages zcrawl sent us.
+    announced: Vec<AddrEntry>,
     other_commands: Vec<String>,
 }
 
@@ -177,6 +180,7 @@ async fn serve(
                     .write_all(&send(Message::Addr(entries)))
                     .await?;
             }
+            Message::Addr(entries) => s.announced.extend(entries),
             other => s.other_commands.push(other.command().to_owned()),
         }
     }
@@ -191,6 +195,7 @@ fn probe_config() -> ProbeConfig {
         handshake_timeout: Duration::from_secs(2),
         getaddr_timeout: Duration::from_secs(2),
         max_addrs: 1000,
+        announce: None,
     }
 }
 
@@ -249,8 +254,180 @@ async fn handshake_and_two_addresses() {
     assert_eq!(ours.services, 0);
     assert!(!ours.relay);
     assert!(seen.got_verack && seen.got_pong && seen.got_getaddr);
+    // Without a listener we announce nothing.
+    assert!(seen.announced.is_empty());
+    assert_eq!(ours.addr_from.services, 0);
     // Nothing else: no block, header or transaction requests.
     assert!(seen.other_commands.is_empty(), "{:?}", seen.other_commands);
+}
+
+#[tokio::test]
+async fn listening_crawler_announces_itself_as_a_full_node() {
+    let returned: Vec<SocketAddr> = vec![
+        "203.0.113.7:8233".parse().unwrap(),
+        "203.0.113.8:8233".parse().unwrap(),
+    ];
+    let mock = spawn_mock(Behaviour::Honest {
+        user_agent: "/Zebra:2.6.0/",
+        addrs: returned.clone(),
+    })
+    .await;
+    let ours: SocketAddr = "198.51.100.9:8233".parse().unwrap();
+    let cfg = ProbeConfig {
+        announce: Some(ours),
+        ..probe_config()
+    };
+
+    let result = peer::probe(mock.addr, &cfg).await;
+    assert!(result.handshake_complete, "{:?}", result.failure);
+    // Our own announcement does not get in the way of the getaddr reply.
+    assert_eq!(result.addrs, returned);
+
+    let seen = mock.seen.lock().await.clone();
+    let v = seen.their_version.unwrap();
+    assert_eq!(v.services, params::NODE_NETWORK);
+    assert_eq!(v.addr_from.services, params::NODE_NETWORK);
+    assert_eq!(v.addr_from.addr, ours);
+    assert_eq!(v.user_agent, params::user_agent().as_bytes());
+    assert_eq!(seen.announced.len(), 1);
+    assert_eq!(seen.announced[0].addr, ours);
+    assert_eq!(seen.announced[0].services, params::NODE_NETWORK);
+    assert!(seen.other_commands.is_empty(), "{:?}", seen.other_commands);
+}
+
+/// A listener on localhost writing to a fresh database.
+struct TestListener {
+    addr: SocketAddr,
+    path: PathBuf,
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+async fn spawn_listener(name: &str) -> TestListener {
+    let path = temp_db(name);
+    let database = Db::new(db::open(&path).unwrap());
+    let l = listener::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = l.local_addr().unwrap();
+    let cfg = ListenerConfig {
+        probe: Arc::new(ProbeConfig {
+            announce: Some("198.51.100.9:8233".parse().unwrap()),
+            ..probe_config()
+        }),
+        max_connections: 8,
+        allow_non_routable: true,
+    };
+    let (stop, stop_rx) = watch::channel(false);
+    let task = tokio::spawn(listener::serve(l, cfg, database, stop_rx));
+    TestListener {
+        addr,
+        path,
+        stop,
+        task,
+    }
+}
+
+impl TestListener {
+    /// Stop the listener; everything it saw is then in the database.
+    async fn finish(self) -> rusqlite::Connection {
+        self.stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), self.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        db::open_read_only(&self.path).unwrap()
+    }
+}
+
+/// Dial `addr` as a node would and send `version`.
+async fn dial(addr: SocketAddr, mut version: VersionMessage) -> BufReader<TcpStream> {
+    version.addr_from.addr = "0.0.0.0:18233".parse().unwrap();
+    let mut conn = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    conn.get_mut()
+        .write_all(&codec::encode_message(MAGIC, &Message::Version(version)))
+        .await
+        .unwrap();
+    conn
+}
+
+async fn read(conn: &mut BufReader<TcpStream>) -> Option<Message> {
+    tokio::time::timeout(Duration::from_secs(3), codec::read_message(conn, MAGIC))
+        .await
+        .unwrap()
+        .ok()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listener_records_a_dialling_node_and_hangs_up() {
+    let l = spawn_listener("listen").await;
+    let mut conn = dial(l.addr, mock_version("/Zebra:7.1.0/")).await;
+
+    let Some(Message::Version(ours)) = read(&mut conn).await else {
+        panic!("expected our version first");
+    };
+    assert_eq!(ours.services, params::NODE_NETWORK);
+    assert_eq!(ours.addr_from.addr, "198.51.100.9:8233".parse().unwrap());
+    assert_eq!(ours.nonce, peer::process_nonce());
+    assert!(matches!(read(&mut conn).await, Some(Message::Verack)));
+    conn.get_mut()
+        .write_all(&codec::encode_message(MAGIC, &Message::Verack))
+        .await
+        .unwrap();
+    // Then zcrawl hangs up without asking for anything.
+    assert!(read(&mut conn).await.is_none());
+
+    let conn = l.finish().await;
+    let (done, implementation, version, claimed): (bool, String, String, String) = conn
+        .query_row(
+            "SELECT handshake_complete, implementation, version, claimed_addr FROM inbound",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert!(done);
+    assert_eq!(
+        (implementation.as_str(), version.as_str()),
+        ("zebra", "7.1.0")
+    );
+    assert_eq!(claimed, "0.0.0.0:18233");
+    // The claimed port on the connection's IP is queued for the crawler.
+    assert_eq!(
+        db::known_addresses(&conn, 0).unwrap(),
+        vec!["127.0.0.1:18233".parse().unwrap()]
+    );
+
+    let st = status::compute(&conn).unwrap();
+    let inbound = st.inbound.unwrap();
+    assert_eq!((inbound.connections, inbound.nodes), (1, 1));
+    assert_eq!(inbound.not_crawled, None);
+    assert_eq!(
+        inbound.versions,
+        vec![("zebra".to_owned(), "7.1.0".to_owned(), 1)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listener_detects_our_own_crawler() {
+    let l = spawn_listener("self").await;
+    let mut v = mock_version(&params::user_agent());
+    v.nonce = peer::process_nonce();
+    let mut conn = dial(l.addr, v).await;
+    // No version back: the connection is just closed.
+    assert!(read(&mut conn).await.is_none());
+
+    let conn = l.finish().await;
+    let (done, reason): (bool, String) = conn
+        .query_row(
+            "SELECT handshake_complete, failure_reason FROM inbound",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(!done);
+    assert_eq!(reason, "self_connection");
+    assert!(db::known_addresses(&conn, 0).unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@
 
 use std::cmp::Reverse;
 use std::io::{self, Write};
+use std::net::SocketAddr;
 
 use rusqlite::{Connection, OptionalExtension};
 use time::OffsetDateTime;
@@ -34,9 +35,11 @@ pub struct Status {
     pub versions: Vec<(String, String, u64)>,
     /// (failure reason, count) for unreachable addresses.
     pub failures: Vec<(String, u64)>,
-    /// Inbound connections in the last [`INBOUND_WINDOW_SECS`], or `None` if
-    /// the listener has never recorded one.
+    /// Inbound connections in the last [`INBOUND_WINDOW_SECS`]. `None` if the
+    /// listener is not configured and has never recorded a connection.
     pub inbound: Option<InboundSummary>,
+    /// The announced address, if the config enables the listener.
+    pub listening: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,8 +70,9 @@ fn round_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RoundRow> {
 const ROUND_COLUMNS: &str =
     "id, started_at, finished_at, status, hit_time_limit, addresses_tried, nodes_reached";
 
-pub fn compute(conn: &Connection) -> anyhow::Result<Status> {
-    compute_at(conn, unix_now())
+/// `listening` is the address the config announces, if the listener is on.
+pub fn compute(conn: &Connection, listening: Option<SocketAddr>) -> anyhow::Result<Status> {
+    compute_at(conn, listening, unix_now())
 }
 
 /// By implementation, then newest version first.
@@ -86,9 +90,10 @@ fn inbound_summary(
     conn: &Connection,
     since: i64,
     last_round: Option<i64>,
+    listening: bool,
 ) -> anyhow::Result<Option<InboundSummary>> {
     let ever: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM inbound)", [], |r| r.get(0))?;
-    if !ever {
+    if !ever && !listening {
         return Ok(None);
     }
     let (connections, nodes): (i64, i64) = conn.query_row(
@@ -132,7 +137,11 @@ fn inbound_summary(
 }
 
 /// [`compute`] with the inbound window ending at `now`.
-pub fn compute_at(conn: &Connection, now: i64) -> anyhow::Result<Status> {
+pub fn compute_at(
+    conn: &Connection,
+    listening: Option<SocketAddr>,
+    now: i64,
+) -> anyhow::Result<Status> {
     let last_complete = conn
         .query_row(
             &format!(
@@ -183,6 +192,7 @@ pub fn compute_at(conn: &Connection, now: i64) -> anyhow::Result<Status> {
         conn,
         now - INBOUND_WINDOW_SECS,
         last_complete.as_ref().map(|r| r.id),
+        listening.is_some(),
     )?;
     Ok(Status {
         last_complete,
@@ -190,6 +200,7 @@ pub fn compute_at(conn: &Connection, now: i64) -> anyhow::Result<Status> {
         versions,
         failures,
         inbound,
+        listening,
     })
 }
 
@@ -228,13 +239,29 @@ fn write_versions(out: &mut impl Write, versions: &[(String, String, u64)]) -> i
     Ok(())
 }
 
-fn write_inbound(out: &mut impl Write, inbound: &Option<InboundSummary>) -> io::Result<()> {
+fn write_inbound(
+    out: &mut impl Write,
+    inbound: &Option<InboundSummary>,
+    listening: Option<SocketAddr>,
+) -> io::Result<()> {
     let Some(i) = inbound else {
         return Ok(());
     };
     writeln!(out)?;
     writeln!(out, "Inbound, last 24 hours:")?;
+    match listening {
+        Some(addr) => writeln!(out, "  announced as:    {addr}")?,
+        None => writeln!(out, "  listener:        off in this config")?,
+    }
     writeln!(out, "  connections:     {}", i.connections)?;
+    if i.connections == 0 {
+        writeln!(
+            out,
+            "  (nodes dial in only after they learn our address through gossip, \
+             which can take hours or days)"
+        )?;
+        return Ok(());
+    }
     writeln!(out, "  nodes (by IP):   {}", i.nodes)?;
     if let Some(n) = i.not_crawled {
         writeln!(
@@ -251,7 +278,7 @@ fn write_inbound(out: &mut impl Write, inbound: &Option<InboundSummary>) -> io::
 
 pub fn write(status: &Status, out: &mut impl Write) -> io::Result<()> {
     write_round(status, out)?;
-    write_inbound(out, &status.inbound)
+    write_inbound(out, &status.inbound, status.listening)
 }
 
 fn write_round(status: &Status, out: &mut impl Write) -> io::Result<()> {

@@ -276,8 +276,10 @@ Shows the most recent complete round:
 - a count per implementation and version;
 - failure reasons for unreachable addresses;
 - any newer round that is still running or was interrupted;
-- if the listener has ever recorded a connection, a summary of the last 24 hours:
-  - inbound connections;
+- if the config sets `listen_addr`, or the listener has ever recorded a connection, a summary
+  of the last 24 hours:
+  - the announced address (pass the service's `--config`, or this shows the listener as off);
+  - inbound connections, and a note when there are none yet;
   - distinct IPs that completed a handshake;
   - how many of those IPs the last round did not reach (nodes only the listener sees);
   - each IP's latest implementation and version.

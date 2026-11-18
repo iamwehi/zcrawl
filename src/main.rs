@@ -173,7 +173,7 @@ fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Status => {
             let conn = db::open_read_only(&config.database)?;
-            let st = status::compute(&conn)?;
+            let st = status::compute(&conn, config.announce_addr())?;
             let mut out = std::io::stdout().lock();
             status::write(&st, &mut out)?;
             out.flush()?;

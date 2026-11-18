@@ -398,7 +398,7 @@ async fn listener_records_a_dialling_node_and_hangs_up() {
         vec!["127.0.0.1:18233".parse().unwrap()]
     );
 
-    let st = status::compute(&conn).unwrap();
+    let st = status::compute(&conn, None).unwrap();
     let inbound = st.inbound.unwrap();
     assert_eq!((inbound.connections, inbound.nodes), (1, 1));
     assert_eq!(inbound.not_crawled, None);
@@ -540,7 +540,7 @@ async fn round_crawls_learned_addresses_once_each() {
     assert_eq!(find(mock_b.addr.port()).3.as_deref(), Some("1.6.1"));
     assert_eq!(find(closed.port()).1.as_deref(), Some("connect_refused"));
 
-    let st = status::compute(&conn).unwrap();
+    let st = status::compute(&conn, None).unwrap();
     assert_eq!(st.last_complete.as_ref().unwrap().nodes_reached, 2);
     assert_eq!(
         st.versions,
@@ -599,7 +599,31 @@ async fn stopped_round_is_interrupted_and_excluded() {
     assert_eq!(summary.status, RoundStatus::Interrupted);
 
     let conn = db::open_read_only(&path).unwrap();
-    let st = status::compute(&conn).unwrap();
+    let st = status::compute(&conn, None).unwrap();
     assert!(st.last_complete.is_none());
     assert_eq!(st.newer_incomplete.unwrap().status, "interrupted");
+}
+
+#[tokio::test]
+async fn status_shows_an_idle_listener() {
+    let path = temp_db("idle");
+    drop(db::open(&path).unwrap());
+    let conn = db::open_read_only(&path).unwrap();
+
+    // Listener off and nothing recorded: no inbound section.
+    let st = status::compute(&conn, None).unwrap();
+    assert!(st.inbound.is_none());
+
+    let ours: SocketAddr = "198.51.100.9:8233".parse().unwrap();
+    let st = status::compute(&conn, Some(ours)).unwrap();
+    let i = st.inbound.as_ref().unwrap();
+    assert_eq!((i.connections, i.nodes), (0, 0));
+    let mut out = Vec::new();
+    status::write(&st, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("announced as:    198.51.100.9:8233"),
+        "{text}"
+    );
+    assert!(text.contains("connections:     0"), "{text}");
 }

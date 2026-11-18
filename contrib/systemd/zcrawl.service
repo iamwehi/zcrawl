@@ -1,0 +1,54 @@
+[Unit]
+Description=zcrawl Zcash network crawler
+Documentation=file:///usr/local/share/doc/zcrawl/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=zcrawl
+Group=zcrawl
+ExecStart=/usr/local/bin/zcrawl run --config /etc/zcrawl/zcrawl.toml
+Restart=on-failure
+RestartSec=30
+# zcrawl marks the running round as interrupted on SIGTERM; give it time to
+# write that.
+TimeoutStopSec=60
+
+# Creates /var/lib/zcrawl owned by the zcrawl user.
+StateDirectory=zcrawl
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/zcrawl
+Environment=RUST_LOG=info
+
+# 200 sockets plus SQLite; leave headroom.
+LimitNOFILE=4096
+
+# Hardening. zcrawl only needs outbound IPv4/IPv6 TCP, DNS, and its state dir.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

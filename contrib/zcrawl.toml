@@ -1,0 +1,40 @@
+# zcrawl configuration. Every key is optional; the values shown are the defaults
+# except `database`, which the systemd unit expects under /var/lib/zcrawl.
+
+# "mainnet" or "testnet". Switches magic bytes, default port and DNS seeders.
+# Use a separate database per network; zcrawl refuses to mix them.
+network = "mainnet"
+
+database = "/var/lib/zcrawl/zcrawl.sqlite"
+
+# A round starts every round_interval_minutes. If a round runs longer, the next
+# one starts as soon as it ends.
+round_interval_minutes = 60
+
+# A round stops starting new connections after this long, finishes the ones in
+# flight, and is recorded as complete with hit_time_limit = 1.
+round_time_limit_minutes = 45
+
+# Each round is seeded with the DNS seeders, extra_peers, and every address
+# learned or reached in the last address_retention_days days.
+address_retention_days = 7
+
+connect_timeout_secs = 5
+handshake_timeout_secs = 10
+# How long to wait for an addr reply after sending getaddr.
+getaddr_timeout_secs = 10
+max_connections = 200
+# Addresses accepted from one peer per round.
+max_addrs_per_peer = 1000
+
+# Defaults to Zebra's seeders for the selected network:
+# seeders = ["dnsseed.str4d.xyz:8233", "dnsseed.z.cash:8233",
+#            "mainnet.seeder.shieldedinfra.net:8233", "mainnet.seeder.zfnd.org:8233",
+#            "seeder.zec.rocks:8233"]
+
+# Peers to crawl every round in addition to the seeders, as "host:port".
+extra_peers = []
+
+# Protocol version sent in our version message. Defaults to 170190, Zebra's
+# current CURRENT_NETWORK_PROTOCOL_VERSION. Change only if Zebra changes it.
+# protocol_version = 170190

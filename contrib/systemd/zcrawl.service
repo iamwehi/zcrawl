@@ -1,6 +1,6 @@
 [Unit]
 Description=zcrawl Zcash network crawler
-Documentation=file:///usr/local/share/doc/zcrawl/README.md
+Documentation=https://github.com/iamwehi/zcrawl
 After=network-online.target
 Wants=network-online.target
 

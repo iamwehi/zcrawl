@@ -8,8 +8,7 @@ since the release was published, and the time to reach 50%, 80% and 95%.
 zcrawl collects no historical data. It records from the moment it is started.
 
 **Contact.** zcrawl announces itself as `/zcrawl:<version>/`. If it causes problems for your
-node, open an issue at **<https://github.com/CHANGE-ME/zcrawl/issues>**.
-<!-- TODO: replace with the real repository or contact URL before deploying. -->
+node, open an issue at **<https://github.com/iamwehi/zcrawl/issues>**.
 
 ## How a round works
 
@@ -37,8 +36,29 @@ Private, loopback, documentation and other non-global addresses are skipped.
 
 ## Install
 
+Building needs Rust 1.89 or newer, because zcrawl uses `File::try_lock`. Distribution packages
+are often older, so install Rust with [rustup](https://rustup.rs). SQLite is compiled in, but
+the build needs a C compiler (`build-essential` on Debian and Ubuntu).
+
 ```sh
-cargo build --release
+git clone https://github.com/iamwehi/zcrawl.git && cd zcrawl
+cargo build --release && cargo test --release
+```
+
+Before deploying, check the machine's network. A VPN or transparent proxy that accepts every
+outbound connection makes zcrawl undercount nodes badly (see the manual check below). The last
+line should print `clean`:
+
+```sh
+timeout 3 bash -c 'exec 3<>/dev/tcp/203.0.113.1/8233' 2>/dev/null \
+  && echo "WARNING: connections are intercepted" || echo "clean"
+```
+
+zcrawl only makes outbound connections. It needs no open inbound ports and no root.
+
+### With root: system service
+
+```sh
 sudo install -m 0755 target/release/zcrawl /usr/local/bin/zcrawl
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin zcrawl
 sudo install -d -m 0755 /etc/zcrawl
@@ -58,8 +78,42 @@ service user:
 sudo -u zcrawl zcrawl --config /etc/zcrawl/zcrawl.toml status
 ```
 
-Building needs Rust 1.89 or newer, because zcrawl uses `File::try_lock`. SQLite is compiled in;
-no system library is needed.
+### Without root: user service or cron
+
+[`contrib/install-user.sh`](contrib/install-user.sh) installs everything under your home
+directory:
+
+| path | contents |
+|---|---|
+| `~/.local/bin/zcrawl` | the binary |
+| `~/.config/zcrawl/zcrawl.toml` | the config, with `database` pointing at `~/.local/share/zcrawl/` (an existing config is kept) |
+| `~/.local/share/zcrawl/` | the database, lock files and, for cron, the log |
+
+Pick how to keep it running:
+
+```sh
+contrib/install-user.sh systemd   # systemd user service (contrib/systemd/zcrawl-user.service)
+contrib/install-user.sh cron      # crontab entries (contrib/cron/zcrawl.crontab)
+contrib/install-user.sh           # install only; start it yourself
+```
+
+- **systemd user service.** It only keeps running after you log out if lingering is enabled.
+  The script tries `loginctl enable-linger`; some servers allow that only for admins. If it
+  fails, the script warns, and you should use cron instead. Logs: `journalctl --user -u zcrawl -f`.
+- **cron.** Starts zcrawl at boot and checks every 10 minutes that it is still running.
+  `flock -n` keeps it to one copy. Logs go to `~/.local/share/zcrawl/zcrawl.log`, a few lines
+  per round.
+
+Query the results with:
+
+```sh
+~/.local/bin/zcrawl --config ~/.config/zcrawl/zcrawl.toml status
+```
+
+To upgrade, run `git pull && cargo build --release`, then the install script again, then
+restart zcrawl:
+- systemd user service: `systemctl --user restart zcrawl`;
+- cron: `pkill -u "$USER" -x zcrawl`, and cron restarts it within 10 minutes.
 
 ## Configuration
 
@@ -358,8 +412,7 @@ counted.
 12. **`getaddr` handling.** zcrawl waits up to 10 s for an `addr` with more than one entry, and
     takes at most 1000 addresses per peer per round.
 13. **Report layout.** Threshold times are printed after the CSV as `#` comment lines on stdout.
-14. **Placeholders.** The contact URL (`CHANGE-ME`) and the license (`MIT OR Apache-2.0`) are
-    placeholders.
+14. **License.** `MIT OR Apache-2.0` is a placeholder; there are no license files yet.
 
 ## Design notes
 
